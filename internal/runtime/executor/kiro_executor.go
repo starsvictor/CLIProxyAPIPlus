@@ -1117,6 +1117,10 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		"kiro-claude-sonnet-4-20250514":   "claude-sonnet-4",
 		"kiro-claude-haiku-4-5":           "claude-haiku-4.5",
 		"kiro-auto":                       "auto",
+		// Short name format (without claude- prefix)
+		"Kiro Opus 4.5":   "claude-opus-4.5",
+		"Kiro Sonnet 4.5": "claude-sonnet-4.5",
+		"Kiro Haiku 4.5": "claude-haiku-4.5",
 		// Native format (no prefix) - used by Kiro IDE directly
 		"claude-opus-4-5":            "claude-opus-4.5",
 		"claude-opus-4.5":            "claude-opus-4.5",

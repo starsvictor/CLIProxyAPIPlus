@@ -349,6 +349,7 @@ func (s *ConfigSynthesizer) synthesizeKiroKeys(ctx *SynthesisContext) []*coreaut
 		}
 
 		// profileArn is optional for AWS Builder ID users
+		prefix := strings.TrimSpace(kk.Prefix)
 		id, token := idGen.Next("kiro:token", accessToken, profileArn)
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("config:kiro[%s]", token),
@@ -360,6 +361,10 @@ func (s *ConfigSynthesizer) synthesizeKiroKeys(ctx *SynthesisContext) []*coreaut
 		if kk.Region != "" {
 			attrs["region"] = kk.Region
 		}
+		if hash := diff.ComputeKiroModelsHash(kk.Models); hash != "" {
+			attrs["models_hash"] = hash
+		}
+		addConfigHeadersToAttrs(kk.Headers, attrs)
 		if kk.AgentTaskType != "" {
 			attrs["agent_task_type"] = kk.AgentTaskType
 		}
@@ -377,6 +382,7 @@ func (s *ConfigSynthesizer) synthesizeKiroKeys(ctx *SynthesisContext) []*coreaut
 			ID:         id,
 			Provider:   "kiro",
 			Label:      "kiro-token",
+			Prefix:     prefix,
 			Status:     coreauth.StatusActive,
 			ProxyURL:   proxyURL,
 			Attributes: attrs,
@@ -391,6 +397,7 @@ func (s *ConfigSynthesizer) synthesizeKiroKeys(ctx *SynthesisContext) []*coreaut
 			a.Metadata["refresh_token"] = refreshToken
 		}
 
+		ApplyAuthExcludedModelsMeta(a, cfg, kk.ExcludedModels, "token")
 		out = append(out, a)
 	}
 	return out

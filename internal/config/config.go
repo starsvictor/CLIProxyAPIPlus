@@ -375,11 +375,20 @@ type KiroKey struct {
 	// ProfileArn is the AWS CodeWhisperer profile ARN.
 	ProfileArn string `yaml:"profile-arn,omitempty" json:"profile-arn,omitempty"`
 
+	// Prefix optionally namespaces models for this credential (e.g., "teamA/claude-sonnet-4-5").
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
 	// Region is the AWS region (default: us-east-1).
 	Region string `yaml:"region,omitempty" json:"region,omitempty"`
 
 	// ProxyURL optionally overrides the global proxy for this configuration.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// Models defines upstream model names and aliases for request routing.
+	Models []KiroModel `yaml:"models,omitempty" json:"models,omitempty"`
+
+	// Headers optionally adds extra HTTP headers for requests sent with this configuration.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 
 	// AgentTaskType sets the Kiro API task type. Known values: "vibe", "dev", "chat".
 	// Leave empty to let API use defaults. Different values may inject different system prompts.
@@ -388,7 +397,22 @@ type KiroKey struct {
 	// PreferredEndpoint sets the preferred Kiro API endpoint/quota.
 	// Values: "codewhisperer" (default, IDE quota) or "amazonq" (CLI quota).
 	PreferredEndpoint string `yaml:"preferred-endpoint,omitempty" json:"preferred-endpoint,omitempty"`
+
+	// ExcludedModels lists model IDs that should be excluded for this provider.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
 }
+
+// KiroModel describes a mapping between an alias and the actual upstream model name.
+type KiroModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m KiroModel) GetName() string  { return m.Name }
+func (m KiroModel) GetAlias() string { return m.Alias }
 
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
@@ -676,9 +700,12 @@ func (cfg *Config) SanitizeKiroKeys() {
 		entry.AccessToken = strings.TrimSpace(entry.AccessToken)
 		entry.RefreshToken = strings.TrimSpace(entry.RefreshToken)
 		entry.ProfileArn = strings.TrimSpace(entry.ProfileArn)
+		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Region = strings.TrimSpace(entry.Region)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.PreferredEndpoint = strings.TrimSpace(entry.PreferredEndpoint)
+		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 	}
 }
 

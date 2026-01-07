@@ -341,7 +341,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				AuthValue: authValue,
 			})
 
-			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 120*time.Second)
+			// Use configured request-timeout instead of hardcoded 120s
+			// This is critical for long-running requests like Extended Thinking or large file uploads
+			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				recordAPIResponseError(ctx, e.cfg, err)

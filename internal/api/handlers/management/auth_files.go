@@ -29,6 +29,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kilo"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
@@ -812,6 +814,87 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority) of an auth file.
+func (h *Handler) PatchAuthFileFields(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name     string  `json:"name"`
+		Prefix   *string `json:"prefix"`
+		ProxyURL *string `json:"proxy_url"`
+		Priority *int    `json:"priority"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Find auth by name or ID
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		auths := h.authManager.List()
+		for _, auth := range auths {
+			if auth.FileName == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	changed := false
+	if req.Prefix != nil {
+		targetAuth.Prefix = *req.Prefix
+		changed = true
+	}
+	if req.ProxyURL != nil {
+		targetAuth.ProxyURL = *req.ProxyURL
+		changed = true
+	}
+	if req.Priority != nil {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if *req.Priority == 0 {
+			delete(targetAuth.Metadata, "priority")
+		} else {
+			targetAuth.Metadata["priority"] = *req.Priority
+		}
+		changed = true
+	}
+
+	if !changed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
+		return
+	}
+
+	targetAuth.UpdatedAt = time.Now()
+
+	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 func (h *Handler) disableAuth(ctx context.Context, id string) {
 	if h == nil || h.authManager == nil {
 		return
@@ -868,11 +951,17 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
 	}
+	if h.postAuthHook != nil {
+		if err := h.postAuthHook(ctx, record); err != nil {
+			return "", fmt.Errorf("post-auth hook failed: %w", err)
+		}
+	}
 	return store.Save(ctx, record)
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing Claude authentication...")
 
@@ -1017,6 +1106,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
 	proxyHTTPClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyHTTPClient)
 
@@ -1192,6 +1282,30 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			}
 			ts.ProjectID = strings.Join(projects, ",")
 			ts.Checked = true
+		} else if strings.EqualFold(requestedProjectID, "GOOGLE_ONE") {
+			ts.Auto = false
+			if errSetup := performGeminiCLISetup(ctx, gemClient, &ts, ""); errSetup != nil {
+				log.Errorf("Google One auto-discovery failed: %v", errSetup)
+				SetOAuthSessionError(state, "Google One auto-discovery failed")
+				return
+			}
+			if strings.TrimSpace(ts.ProjectID) == "" {
+				log.Error("Google One auto-discovery returned empty project ID")
+				SetOAuthSessionError(state, "Google One auto-discovery returned empty project ID")
+				return
+			}
+			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
+			if errCheck != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
+				SetOAuthSessionError(state, "Failed to verify Cloud AI API status")
+				return
+			}
+			ts.Checked = isChecked
+			if !isChecked {
+				log.Error("Cloud AI API is not enabled for the auto-discovered project")
+				SetOAuthSessionError(state, "Cloud AI API not enabled")
+				return
+			}
 		} else {
 			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
 				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
@@ -1251,6 +1365,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 
 func (h *Handler) RequestCodexToken(c *gin.Context) {
 	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing Codex authentication...")
 
@@ -1396,6 +1511,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing Antigravity authentication...")
 
@@ -1560,6 +1676,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 func (h *Handler) RequestQwenToken(c *gin.Context) {
 	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing Qwen authentication...")
 
@@ -1613,8 +1730,86 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
+func (h *Handler) RequestKimiToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	fmt.Println("Initializing Kimi authentication...")
+
+	state := fmt.Sprintf("kmi-%d", time.Now().UnixNano())
+	// Initialize Kimi auth service
+	kimiAuth := kimi.NewKimiAuth(h.cfg)
+
+	// Generate authorization URL
+	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)
+	if errStartDeviceFlow != nil {
+		log.Errorf("Failed to generate authorization URL: %v", errStartDeviceFlow)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		return
+	}
+	authURL := deviceFlow.VerificationURIComplete
+	if authURL == "" {
+		authURL = deviceFlow.VerificationURI
+	}
+
+	RegisterOAuthSession(state, "kimi")
+
+	go func() {
+		fmt.Println("Waiting for authentication...")
+		authBundle, errWaitForAuthorization := kimiAuth.WaitForAuthorization(ctx, deviceFlow)
+		if errWaitForAuthorization != nil {
+			SetOAuthSessionError(state, "Authentication failed")
+			fmt.Printf("Authentication failed: %v\n", errWaitForAuthorization)
+			return
+		}
+
+		// Create token storage
+		tokenStorage := kimiAuth.CreateTokenStorage(authBundle)
+
+		metadata := map[string]any{
+			"type":          "kimi",
+			"access_token":  authBundle.TokenData.AccessToken,
+			"refresh_token": authBundle.TokenData.RefreshToken,
+			"token_type":    authBundle.TokenData.TokenType,
+			"scope":         authBundle.TokenData.Scope,
+			"timestamp":     time.Now().UnixMilli(),
+		}
+		if authBundle.TokenData.ExpiresAt > 0 {
+			expired := time.Unix(authBundle.TokenData.ExpiresAt, 0).UTC().Format(time.RFC3339)
+			metadata["expired"] = expired
+		}
+		if strings.TrimSpace(authBundle.DeviceID) != "" {
+			metadata["device_id"] = strings.TrimSpace(authBundle.DeviceID)
+		}
+
+		fileName := fmt.Sprintf("kimi-%d.json", time.Now().UnixMilli())
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "kimi",
+			FileName: fileName,
+			Label:    "Kimi User",
+			Storage:  tokenStorage,
+			Metadata: metadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use Kimi services through this CLI")
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("kimi")
+	}()
+
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
 func (h *Handler) RequestIFlowToken(c *gin.Context) {
 	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing iFlow authentication...")
 
@@ -1734,8 +1929,6 @@ func (h *Handler) RequestGitHubToken(c *gin.Context) {
 	state := fmt.Sprintf("gh-%d", time.Now().UnixNano())
 
 	// Initialize Copilot auth service
-	// We need to import "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot" first if not present
-	// Assuming copilot package is imported as "copilot"
 	deviceClient := copilot.NewDeviceFlowClient(h.cfg)
 
 	// Initiate device flow
@@ -1749,7 +1942,7 @@ func (h *Handler) RequestGitHubToken(c *gin.Context) {
 	authURL := deviceCode.VerificationURI
 	userCode := deviceCode.UserCode
 
-	RegisterOAuthSession(state, "github")
+	RegisterOAuthSession(state, "github-copilot")
 
 	go func() {
 		fmt.Printf("Please visit %s and enter code: %s\n", authURL, userCode)
@@ -1761,9 +1954,13 @@ func (h *Handler) RequestGitHubToken(c *gin.Context) {
 			return
 		}
 
-		username, errUser := deviceClient.FetchUserInfo(ctx, tokenData.AccessToken)
+		userInfo, errUser := deviceClient.FetchUserInfo(ctx, tokenData.AccessToken)
 		if errUser != nil {
 			log.Warnf("Failed to fetch user info: %v", errUser)
+		}
+
+		username := userInfo.Login
+		if username == "" {
 			username = "github-user"
 		}
 
@@ -1772,18 +1969,26 @@ func (h *Handler) RequestGitHubToken(c *gin.Context) {
 			TokenType:   tokenData.TokenType,
 			Scope:       tokenData.Scope,
 			Username:    username,
+			Email:       userInfo.Email,
+			Name:        userInfo.Name,
 			Type:        "github-copilot",
 		}
 
-		fileName := fmt.Sprintf("github-%s.json", username)
+		fileName := fmt.Sprintf("github-copilot-%s.json", username)
+		label := userInfo.Email
+		if label == "" {
+			label = username
+		}
 		record := &coreauth.Auth{
 			ID:       fileName,
-			Provider: "github",
+			Provider: "github-copilot",
+			Label:    label,
 			FileName: fileName,
 			Storage:  tokenStorage,
 			Metadata: map[string]any{
-				"email":    username,
+				"email":    userInfo.Email,
 				"username": username,
+				"name":     userInfo.Name,
 			},
 		}
 
@@ -1797,7 +2002,7 @@ func (h *Handler) RequestGitHubToken(c *gin.Context) {
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use GitHub Copilot services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("github")
+		CompleteOAuthSessionsByProvider("github-copilot")
 	}()
 
 	c.JSON(200, gin.H{
@@ -2047,7 +2252,48 @@ func performGeminiCLISetup(ctx context.Context, httpClient *http.Client, storage
 		}
 	}
 	if projectID == "" {
-		return &projectSelectionRequiredError{}
+		// Auto-discovery: try onboardUser without specifying a project
+		// to let Google auto-provision one (matches Gemini CLI headless behavior
+		// and Antigravity's FetchProjectID pattern).
+		autoOnboardReq := map[string]any{
+			"tierId":   tierID,
+			"metadata": metadata,
+		}
+
+		autoCtx, autoCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer autoCancel()
+		for attempt := 1; ; attempt++ {
+			var onboardResp map[string]any
+			if errOnboard := callGeminiCLI(autoCtx, httpClient, "onboardUser", autoOnboardReq, &onboardResp); errOnboard != nil {
+				return fmt.Errorf("auto-discovery onboardUser: %w", errOnboard)
+			}
+
+			if done, okDone := onboardResp["done"].(bool); okDone && done {
+				if resp, okResp := onboardResp["response"].(map[string]any); okResp {
+					switch v := resp["cloudaicompanionProject"].(type) {
+					case string:
+						projectID = strings.TrimSpace(v)
+					case map[string]any:
+						if id, okID := v["id"].(string); okID {
+							projectID = strings.TrimSpace(id)
+						}
+					}
+				}
+				break
+			}
+
+			log.Debugf("Auto-discovery: onboarding in progress, attempt %d...", attempt)
+			select {
+			case <-autoCtx.Done():
+				return &projectSelectionRequiredError{}
+			case <-time.After(2 * time.Second):
+			}
+		}
+
+		if projectID == "" {
+			return &projectSelectionRequiredError{}
+		}
+		log.Infof("Auto-discovered project ID via onboarding: %s", projectID)
 	}
 
 	onboardReqBody := map[string]any{
@@ -2297,6 +2543,14 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "wait"})
 }
 
+// PopulateAuthContext extracts request info and adds it to the context
+func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
+	info := &coreauth.RequestInfo{
+		Query:   c.Request.URL.Query(),
+		Headers: c.Request.Header,
+	}
+	return coreauth.WithRequestInfo(ctx, info)
+}
 const kiroCallbackPort = 9876
 
 func (h *Handler) RequestKiroToken(c *gin.Context) {
@@ -2590,4 +2844,89 @@ func generateKiroPKCE() (verifier, challenge string, err error) {
 	challenge = base64.RawURLEncoding.EncodeToString(h[:])
 
 	return verifier, challenge, nil
+}
+
+func (h *Handler) RequestKiloToken(c *gin.Context) {
+	ctx := context.Background()
+
+	fmt.Println("Initializing Kilo authentication...")
+
+	state := fmt.Sprintf("kil-%d", time.Now().UnixNano())
+	kilocodeAuth := kilo.NewKiloAuth()
+
+	resp, err := kilocodeAuth.InitiateDeviceFlow(ctx)
+	if err != nil {
+		log.Errorf("Failed to initiate device flow: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initiate device flow"})
+		return
+	}
+
+	RegisterOAuthSession(state, "kilo")
+
+	go func() {
+		fmt.Printf("Please visit %s and enter code: %s\n", resp.VerificationURL, resp.Code)
+
+		status, err := kilocodeAuth.PollForToken(ctx, resp.Code)
+		if err != nil {
+			SetOAuthSessionError(state, "Authentication failed")
+			fmt.Printf("Authentication failed: %v\n", err)
+			return
+		}
+
+		profile, err := kilocodeAuth.GetProfile(ctx, status.Token)
+		if err != nil {
+			log.Warnf("Failed to fetch profile: %v", err)
+			profile = &kilo.Profile{Email: status.UserEmail}
+		}
+
+		var orgID string
+		if len(profile.Orgs) > 0 {
+			orgID = profile.Orgs[0].ID
+		}
+
+		defaults, err := kilocodeAuth.GetDefaults(ctx, status.Token, orgID)
+		if err != nil {
+			defaults = &kilo.Defaults{}
+		}
+
+		ts := &kilo.KiloTokenStorage{
+			Token:          status.Token,
+			OrganizationID: orgID,
+			Model:          defaults.Model,
+			Email:          status.UserEmail,
+			Type:           "kilo",
+		}
+
+		fileName := kilo.CredentialFileName(status.UserEmail)
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "kilo",
+			FileName: fileName,
+			Storage:  ts,
+			Metadata: map[string]any{
+				"email":           status.UserEmail,
+				"organization_id": orgID,
+				"model":          defaults.Model,
+			},
+		}
+
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("kilo")
+	}()
+
+	c.JSON(200, gin.H{
+		"status":           "ok",
+		"url":              resp.VerificationURL,
+		"state":            state,
+		"user_code":        resp.Code,
+		"verification_uri": resp.VerificationURL,
+	})
 }

@@ -69,6 +69,9 @@ type Config struct {
 
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
+	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
+	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
+	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 
@@ -87,12 +90,20 @@ type Config struct {
 	// KiroKey defines a list of Kiro (AWS CodeWhisperer) configurations.
 	KiroKey []KiroKey `yaml:"kiro" json:"kiro"`
 
+	// KiroFingerprint defines a global fingerprint configuration for all Kiro requests.
+	// When set, all Kiro requests will use this fixed fingerprint instead of random generation.
+	KiroFingerprint *KiroFingerprintConfig `yaml:"kiro-fingerprint,omitempty" json:"kiro-fingerprint,omitempty"`
+
 	// KiroPreferredEndpoint sets the global default preferred endpoint for all Kiro providers.
 	// Values: "ide" (default, CodeWhisperer) or "cli" (Amazon Q).
 	KiroPreferredEndpoint string `yaml:"kiro-preferred-endpoint" json:"kiro-preferred-endpoint"`
 
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
+
+	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
+	// These are used only when the client does not send its own headers.
+	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
 
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
@@ -141,6 +152,14 @@ type ClaudeHeaderDefaults struct {
 	PackageVersion string `yaml:"package-version" json:"package-version"`
 	RuntimeVersion string `yaml:"runtime-version" json:"runtime-version"`
 	Timeout        string `yaml:"timeout" json:"timeout"`
+}
+
+// CodexHeaderDefaults configures fallback header values injected into Codex
+// model requests for OAuth/file-backed auth when the client omits them.
+// UserAgent applies to HTTP and websocket requests; BetaFeatures only applies to websockets.
+type CodexHeaderDefaults struct {
+	UserAgent    string `yaml:"user-agent" json:"user-agent"`
+	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -477,6 +496,9 @@ type KiroKey struct {
 	// Region is the AWS region (default: us-east-1).
 	Region string `yaml:"region,omitempty" json:"region,omitempty"`
 
+	// StartURL is the IAM Identity Center (IDC) start URL for SSO login.
+	StartURL string `yaml:"start-url,omitempty" json:"start-url,omitempty"`
+
 	// ProxyURL optionally overrides the global proxy for this configuration.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 
@@ -487,6 +509,20 @@ type KiroKey struct {
 	// PreferredEndpoint sets the preferred Kiro API endpoint/quota.
 	// Values: "codewhisperer" (default, IDE quota) or "amazonq" (CLI quota).
 	PreferredEndpoint string `yaml:"preferred-endpoint,omitempty" json:"preferred-endpoint,omitempty"`
+}
+
+// KiroFingerprintConfig defines a global fingerprint configuration for Kiro requests.
+// When configured, all Kiro requests will use this fixed fingerprint instead of random generation.
+// Empty fields will fall back to random selection from built-in pools.
+type KiroFingerprintConfig struct {
+	OIDCSDKVersion      string `yaml:"oidc-sdk-version,omitempty" json:"oidc-sdk-version,omitempty"`
+	RuntimeSDKVersion   string `yaml:"runtime-sdk-version,omitempty" json:"runtime-sdk-version,omitempty"`
+	StreamingSDKVersion string `yaml:"streaming-sdk-version,omitempty" json:"streaming-sdk-version,omitempty"`
+	OSType              string `yaml:"os-type,omitempty" json:"os-type,omitempty"`
+	OSVersion           string `yaml:"os-version,omitempty" json:"os-version,omitempty"`
+	NodeVersion         string `yaml:"node-version,omitempty" json:"node-version,omitempty"`
+	KiroVersion         string `yaml:"kiro-version,omitempty" json:"kiro-version,omitempty"`
+	KiroHash            string `yaml:"kiro-hash,omitempty" json:"kiro-hash,omitempty"`
 }
 
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
@@ -555,16 +591,6 @@ func LoadConfig(configFile string) (*Config, error) {
 // If optional is true and the file is missing, it returns an empty Config.
 // If optional is true and the file is empty or invalid, it returns an empty Config.
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
-	// NOTE: Startup oauth-model-alias migration is intentionally disabled.
-	// Reason: avoid mutating config.yaml during server startup.
-	// Re-enable the block below if automatic startup migration is needed again.
-	// if migrated, err := MigrateOAuthModelAlias(configFile); err != nil {
-	// 	// Log warning but don't fail - config loading should still work
-	// 	fmt.Printf("Warning: oauth-model-alias migration failed: %v\n", err)
-	// } else if migrated {
-	// 	fmt.Println("Migrated oauth-model-mappings to oauth-model-alias")
-	// }
-
 	// Read the entire configuration file into memory.
 	data, err := os.ReadFile(configFile)
 	if err != nil {
@@ -652,14 +678,21 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.ErrorLogsMaxFiles = 10
 	}
 
+	if cfg.MaxRetryCredentials < 0 {
+		cfg.MaxRetryCredentials = 0
+	}
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
-	// Sanitize Vertex-compatible API keys: drop entries without base-url
+	// Sanitize Vertex-compatible API keys.
 	cfg.SanitizeVertexCompatKeys()
 
 	// Sanitize Codex keys: drop entries without base-url
 	cfg.SanitizeCodexKeys()
+
+	// Sanitize Codex header defaults.
+	cfg.SanitizeCodexHeaderDefaults()
 
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
@@ -751,6 +784,16 @@ func payloadRawString(value any) ([]byte, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// SanitizeCodexHeaderDefaults trims surrounding whitespace from the
+// configured Codex header fallback values.
+func (cfg *Config) SanitizeCodexHeaderDefaults() {
+	if cfg == nil {
+		return
+	}
+	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
@@ -1648,9 +1691,6 @@ func pruneMappingToGeneratedKeys(dstRoot, srcRoot *yaml.Node, key string) {
 	srcIdx := findMapKeyIndex(srcRoot, key)
 	if srcIdx < 0 {
 		// Keep an explicit empty mapping for oauth-model-alias when it was previously present.
-		//
-		// Rationale: LoadConfig runs MigrateOAuthModelAlias before unmarshalling. If the
-		// oauth-model-alias key is missing, migration will add the default antigravity aliases.
 		// When users delete the last channel from oauth-model-alias via the management API,
 		// we want that deletion to persist across hot reloads and restarts.
 		if key == "oauth-model-alias" {
